@@ -272,7 +272,11 @@ impl From<Bound<'_, PyBytes>> for PyBackedBytes {
 
 impl From<Bound<'_, PyByteArray>> for PyBackedBytes {
     fn from(py_bytearray: Bound<'_, PyByteArray>) -> Self {
-        let s = Arc::<[u8]>::from(py_bytearray.to_vec());
+        let s = crate::sync::critical_section::with_critical_section(&py_bytearray, || {
+            // SAFETY: The critical section prevents concurrent mutations on free-threaded
+            // Python, and copying the slice does not invoke Python code.
+            Arc::<[u8]>::from(unsafe { py_bytearray.as_bytes() })
+        });
         let data = NonNull::from(s.as_ref());
         Self {
             storage: PyBackedBytesStorage::Rust(s),
@@ -504,8 +508,21 @@ mod test {
     fn py_backed_bytes_from_bytearray() {
         Python::attach(|py| {
             let b = PyByteArray::new(py, b"abcde");
-            let py_backed_bytes = PyBackedBytes::from(b);
+            let py_backed_bytes = PyBackedBytes::from(b.clone());
             assert_eq!(&*py_backed_bytes, b"abcde");
+
+            // Extracted bytes own their copy independently of the mutable source.
+            unsafe { b.as_bytes_mut()[0] = b'x' };
+            assert_eq!(&*py_backed_bytes, b"abcde");
+        });
+    }
+
+    #[test]
+    fn py_backed_bytes_from_empty_bytearray() {
+        Python::attach(|py| {
+            let b = PyByteArray::new(py, b"");
+            let py_backed_bytes = PyBackedBytes::from(b);
+            assert!(py_backed_bytes.is_empty());
         });
     }
 

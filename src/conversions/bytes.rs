@@ -73,7 +73,7 @@ use crate::instance::Bound;
 #[allow(unused_imports, reason = "used to build docs")]
 use crate::platform::prelude::*;
 use crate::pybacked::PyBackedBytes;
-use crate::types::PyBytes;
+use crate::types::{PyByteArray, PyByteArrayMethods, PyBytes};
 #[cfg(feature = "experimental-inspect")]
 use crate::PyTypeInfo;
 use crate::{Borrowed, CastError, FromPyObject, PyAny, PyErr, Python};
@@ -85,7 +85,19 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Bytes {
     const INPUT_TYPE: PyStaticExpr = PyBackedBytes::INPUT_TYPE;
 
     fn extract(obj: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
-        Ok(Bytes::from_owner(obj.extract::<PyBackedBytes>()?))
+        if let Ok(bytearray) = obj.cast::<PyByteArray>() {
+            let bytearray = bytearray.to_owned();
+            Ok(crate::sync::critical_section::with_critical_section(
+                &bytearray,
+                || {
+                    // SAFETY: The critical section prevents concurrent mutations on
+                    // free-threaded Python, and the slice is only used to copy its data.
+                    Bytes::copy_from_slice(unsafe { bytearray.as_bytes() })
+                },
+            ))
+        } else {
+            Ok(Bytes::from_owner(obj.extract::<PyBackedBytes>()?))
+        }
     }
 }
 
