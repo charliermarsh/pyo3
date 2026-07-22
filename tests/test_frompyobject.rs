@@ -597,10 +597,22 @@ fn test_enum_does_not_repeat_failed_extractors() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static EXTRACTIONS: AtomicUsize = AtomicUsize::new(0);
+    static NORMALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    struct LazyArguments;
+
+    impl pyo3::PyErrArguments for LazyArguments {
+        fn arguments(self, py: Python<'_>) -> Py<PyAny> {
+            NORMALIZATIONS.fetch_add(1, Ordering::Relaxed);
+            PyString::new(py, "speculative extraction failed")
+                .into_any()
+                .unbind()
+        }
+    }
 
     fn failed_extractor(_: &Bound<'_, PyAny>) -> PyResult<usize> {
         EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
-        Err(PyValueError::new_err("speculative extraction failed"))
+        Err(PyValueError::new_err(LazyArguments))
     }
 
     #[derive(Debug, FromPyObject)]
@@ -612,6 +624,7 @@ fn test_enum_does_not_repeat_failed_extractors() {
 
     Python::attach(|py| {
         EXTRACTIONS.store(0, Ordering::Relaxed);
+        NORMALIZATIONS.store(0, Ordering::Relaxed);
         let value = py.None();
         let extracted = value.extract::<ExtractOnce<'_>>(py).unwrap();
         let ExtractOnce::Succeeded(value) = extracted else {
@@ -619,6 +632,52 @@ fn test_enum_does_not_repeat_failed_extractors() {
         };
         assert!(value.is_none());
         assert_eq!(EXTRACTIONS.load(Ordering::Relaxed), 1);
+        assert_eq!(NORMALIZATIONS.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn test_enum_normalizes_failed_extraction_before_later_variants() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static STATE: AtomicUsize = AtomicUsize::new(0);
+
+    struct StatefulArguments;
+
+    impl pyo3::PyErrArguments for StatefulArguments {
+        fn arguments(self, py: Python<'_>) -> Py<PyAny> {
+            PyString::new(py, &format!("state {}", STATE.load(Ordering::Relaxed)))
+                .into_any()
+                .unbind()
+        }
+    }
+
+    fn first_extractor(_: &Bound<'_, PyAny>) -> PyResult<usize> {
+        Err(PyValueError::new_err(StatefulArguments))
+    }
+
+    fn second_extractor(_: &Bound<'_, PyAny>) -> PyResult<usize> {
+        STATE.store(1, Ordering::Relaxed);
+        Err(PyValueError::new_err("second failed"))
+    }
+
+    #[derive(Debug, FromPyObject)]
+    #[allow(dead_code)]
+    enum NormalizationOrder {
+        First(#[pyo3(from_py_with = first_extractor)] usize),
+        Second(#[pyo3(from_py_with = second_extractor)] usize),
+    }
+
+    Python::attach(|py| {
+        STATE.store(0, Ordering::Relaxed);
+        let error = py.None().extract::<NormalizationOrder>(py).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\
+TypeError: failed to extract enum NormalizationOrder ('First | Second')\n\
+- variant First (First): TypeError: failed to extract field NormalizationOrder::First.0, caused by ValueError: state 0\n\
+- variant Second (Second): TypeError: failed to extract field NormalizationOrder::Second.0, caused by ValueError: second failed"
+        );
     });
 }
 

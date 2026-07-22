@@ -25,6 +25,13 @@ impl From<PyErr> for DeferredFromPyObjectError {
 }
 
 impl DeferredFromPyObjectError {
+    fn normalize_field_error(py: Python<'_>, error: PyErr) -> PyErr {
+        // Field-error wrapping previously normalized its cause immediately, so retain
+        // that observable timing while deferring construction of the wrapper itself.
+        let _ = error.value(py);
+        error
+    }
+
     fn clone_as_pyerr(&self, py: Python<'_>) -> PyErr {
         match self {
             Self::Plain(error) => error.clone_ref(py),
@@ -111,7 +118,7 @@ where
 {
     obj.extract::<T>()
         .map_err(|error| DeferredFromPyObjectError::StructField {
-            error: error.into(),
+            error: DeferredFromPyObjectError::normalize_field_error(obj.py(), error.into()),
             struct_name,
             field_name,
         })
@@ -141,7 +148,7 @@ pub fn extract_struct_field_with_deferred<'a, 'py, T>(
     field_name: &'static str,
 ) -> Result<T, DeferredFromPyObjectError> {
     extractor(obj).map_err(|error| DeferredFromPyObjectError::StructField {
-        error,
+        error: DeferredFromPyObjectError::normalize_field_error(obj.py(), error),
         struct_name,
         field_name,
     })
@@ -190,7 +197,7 @@ where
 {
     obj.extract::<T>()
         .map_err(|error| DeferredFromPyObjectError::TupleField {
-            error: error.into(),
+            error: DeferredFromPyObjectError::normalize_field_error(obj.py(), error.into()),
             struct_name,
             index,
         })
@@ -220,7 +227,7 @@ pub fn extract_tuple_struct_field_with_deferred<'a, 'py, T>(
     index: usize,
 ) -> Result<T, DeferredFromPyObjectError> {
     extractor(obj).map_err(|error| DeferredFromPyObjectError::TupleField {
-        error,
+        error: DeferredFromPyObjectError::normalize_field_error(obj.py(), error),
         struct_name,
         index,
     })
