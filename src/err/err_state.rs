@@ -18,63 +18,93 @@ use crate::{
     Bound, Py, PyAny, PyErrArguments, PyTypeInfo, Python,
 };
 
-pub(crate) struct PyErrState {
+pub(crate) enum PyErrState {
+    Normalized(PyErrStateNormalized),
+    Lazy(Box<dyn PyErrStateLazy>),
+}
+
+pub(crate) trait PyErrStateLazy: Send + Sync {
+    fn restore(self: Box<Self>, py: Python<'_>);
+
+    fn as_normalized(&self, py: Python<'_>) -> &PyErrStateNormalized;
+}
+
+struct PyErrStateLazyImpl<F> {
     // Safety: can only hand out references when in the "normalized" state. Will never change
     // after normalization.
     normalized: Once,
     // Guard against re-entrancy when normalizing the exception state.
     normalizing_thread: Mutex<Option<ThreadId>>,
-    inner: UnsafeCell<Option<PyErrStateInner>>,
+    inner: UnsafeCell<Option<PyErrStateInner<F>>>,
 }
 
 // Safety: The inner value is protected by locking to ensure that only the normalized state is
 // handed out as a reference.
-unsafe impl Send for PyErrState {}
-unsafe impl Sync for PyErrState {}
+unsafe impl<F: Send> Send for PyErrStateLazyImpl<F> {}
+unsafe impl<F: Send + Sync> Sync for PyErrStateLazyImpl<F> {}
 #[cfg(feature = "nightly")]
 unsafe impl crate::marker::Ungil for PyErrState {}
+#[cfg(feature = "nightly")]
+unsafe impl<F> crate::marker::Ungil for PyErrStateLazyImpl<F> {}
 
 impl PyErrState {
-    pub(crate) fn lazy(f: Box<PyErrStateLazyFn>) -> Self {
-        Self::from_inner(PyErrStateInner::Lazy(f))
+    pub(crate) fn lazy<F>(f: F) -> Self
+    where
+        F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput + Send + Sync + 'static,
+    {
+        Self::Lazy(Box::new(PyErrStateLazyImpl::new(f)))
     }
 
     pub(crate) fn lazy_arguments(ptype: Py<PyAny>, args: impl PyErrArguments + 'static) -> Self {
-        Self::from_inner(PyErrStateInner::Lazy(Box::new(move |py| {
-            PyErrStateLazyFnOutput {
-                ptype,
-                pvalue: args.arguments(py),
-            }
-        })))
+        Self::lazy(move |py| PyErrStateLazyFnOutput {
+            ptype,
+            pvalue: args.arguments(py),
+        })
     }
 
     pub(crate) fn normalized(normalized: PyErrStateNormalized) -> Self {
-        let state = Self::from_inner(PyErrStateInner::Normalized(normalized));
-        // This state is already normalized, by completing the Once immediately we avoid
-        // reaching the `py.detach` in `make_normalized` which is less efficient
-        // and introduces a GIL switch which could deadlock.
-        // See https://github.com/PyO3/pyo3/issues/4764
-        state.normalized.call_once(|| {});
-        state
+        Self::Normalized(normalized)
     }
 
     pub(crate) fn restore(self, py: Python<'_>) {
+        match self {
+            Self::Normalized(normalized) => restore_normalized(py, normalized),
+            Self::Lazy(lazy) => lazy.restore(py),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_normalized(&self, py: Python<'_>) -> &PyErrStateNormalized {
+        match self {
+            Self::Normalized(normalized) => normalized,
+            Self::Lazy(lazy) => lazy.as_normalized(py),
+        }
+    }
+}
+
+impl<F> PyErrStateLazyImpl<F> {
+    fn new(f: F) -> Self {
+        Self {
+            normalized: Once::new(),
+            normalizing_thread: Mutex::new(None),
+            inner: UnsafeCell::new(Some(PyErrStateInner::Lazy(f))),
+        }
+    }
+}
+
+impl<F> PyErrStateLazy for PyErrStateLazyImpl<F>
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput + Send + Sync + 'static,
+{
+    fn restore(self: Box<Self>, py: Python<'_>) {
         self.inner
             .into_inner()
             .expect("PyErr state should never be invalid outside of normalization")
             .restore(py)
     }
 
-    fn from_inner(inner: PyErrStateInner) -> Self {
-        Self {
-            normalized: Once::new(),
-            normalizing_thread: Mutex::new(None),
-            inner: UnsafeCell::new(Some(inner)),
-        }
-    }
-
     #[inline]
-    pub(crate) fn as_normalized(&self, py: Python<'_>) -> &PyErrStateNormalized {
+    fn as_normalized(&self, py: Python<'_>) -> &PyErrStateNormalized {
         if self.normalized.is_completed() {
             match unsafe {
                 // Safety: self.inner will never be written again once normalized.
@@ -87,7 +117,12 @@ impl PyErrState {
 
         self.make_normalized(py)
     }
+}
 
+impl<F> PyErrStateLazyImpl<F>
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput + Send + Sync + 'static,
+{
     #[cold]
     fn make_normalized(&self, py: Python<'_>) -> &PyErrStateNormalized {
         // This process is safe because:
@@ -307,15 +342,15 @@ pub(crate) struct PyErrStateLazyFnOutput {
     pub(crate) pvalue: Py<PyAny>,
 }
 
-pub(crate) type PyErrStateLazyFn =
-    dyn for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput + Send + Sync;
-
-enum PyErrStateInner {
-    Lazy(Box<PyErrStateLazyFn>),
+enum PyErrStateInner<F> {
+    Lazy(F),
     Normalized(PyErrStateNormalized),
 }
 
-impl PyErrStateInner {
+impl<F> PyErrStateInner<F>
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput,
+{
     fn normalize(self, py: Python<'_>) -> PyErrStateNormalized {
         match self {
             #[cfg(not(Py_3_12))]
@@ -339,40 +374,51 @@ impl PyErrStateInner {
 
     #[cfg(not(Py_3_12))]
     fn restore(self, py: Python<'_>) {
-        let (ptype, pvalue, ptraceback) = match self {
-            PyErrStateInner::Lazy(lazy) => lazy_into_normalized_ffi_tuple(py, lazy),
-            PyErrStateInner::Normalized(PyErrStateNormalized {
-                ptype,
-                pvalue,
-                ptraceback,
-            }) => (
-                ptype.into_ptr(),
-                pvalue.into_ptr(),
-                ptraceback
-                    .into_inner()
-                    .unwrap()
-                    .map_or(core::ptr::null_mut(), Py::into_ptr),
-            ),
-        };
-        unsafe { ffi::PyErr_Restore(ptype, pvalue, ptraceback) }
+        match self {
+            PyErrStateInner::Lazy(lazy) => {
+                let (ptype, pvalue, ptraceback) = lazy_into_normalized_ffi_tuple(py, lazy);
+                unsafe { ffi::PyErr_Restore(ptype, pvalue, ptraceback) }
+            }
+            PyErrStateInner::Normalized(normalized) => restore_normalized(py, normalized),
+        }
     }
 
     #[cfg(Py_3_12)]
     fn restore(self, py: Python<'_>) {
         match self {
             PyErrStateInner::Lazy(lazy) => raise_lazy(py, lazy),
-            PyErrStateInner::Normalized(PyErrStateNormalized { pvalue }) => unsafe {
-                ffi::PyErr_SetRaisedException(pvalue.into_ptr())
-            },
+            PyErrStateInner::Normalized(normalized) => restore_normalized(py, normalized),
         }
     }
 }
 
 #[cfg(not(Py_3_12))]
-fn lazy_into_normalized_ffi_tuple(
+fn restore_normalized(_py: Python<'_>, normalized: PyErrStateNormalized) {
+    let PyErrStateNormalized {
+        ptype,
+        pvalue,
+        ptraceback,
+    } = normalized;
+    let ptraceback = ptraceback
+        .into_inner()
+        .unwrap()
+        .map_or(core::ptr::null_mut(), Py::into_ptr);
+    unsafe { ffi::PyErr_Restore(ptype.into_ptr(), pvalue.into_ptr(), ptraceback) };
+}
+
+#[cfg(Py_3_12)]
+fn restore_normalized(_py: Python<'_>, normalized: PyErrStateNormalized) {
+    unsafe { ffi::PyErr_SetRaisedException(normalized.pvalue.into_ptr()) };
+}
+
+#[cfg(not(Py_3_12))]
+fn lazy_into_normalized_ffi_tuple<F>(
     py: Python<'_>,
-    lazy: Box<PyErrStateLazyFn>,
-) -> (*mut ffi::PyObject, *mut ffi::PyObject, *mut ffi::PyObject) {
+    lazy: F,
+) -> (*mut ffi::PyObject, *mut ffi::PyObject, *mut ffi::PyObject)
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput,
+{
     // To be consistent with 3.12 logic, go via raise_lazy, but also then normalize
     // the resulting exception
     raise_lazy(py, lazy);
@@ -393,7 +439,10 @@ fn lazy_into_normalized_ffi_tuple(
 ///
 /// This would require either moving some logic from C to Rust, or requesting a new
 /// API in CPython.
-fn raise_lazy(py: Python<'_>, lazy: Box<PyErrStateLazyFn>) {
+fn raise_lazy<F>(py: Python<'_>, lazy: F)
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput,
+{
     let PyErrStateLazyFnOutput { ptype, pvalue } = lazy(py);
     unsafe {
         if ffi::PyExceptionClass_Check(ptype.as_ptr()) == 0 {
