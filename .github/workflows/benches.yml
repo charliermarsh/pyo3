@@ -45,6 +45,9 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      - name: Measure Rust allocations and Python peak memory
+        run: cargo run --release --manifest-path pyo3-benches/Cargo.toml --bin memory-benchmarks
+
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:

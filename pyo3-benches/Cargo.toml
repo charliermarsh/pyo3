@@ -7,6 +7,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+hashbrown = "0.17"
+num-bigint = "0.4.3"
 pyo3 = { path = "../", features = ["auto-initialize", "full"] }
 
 [build-dependencies]
@@ -15,12 +17,14 @@ pyo3-build-config = { path = "../pyo3-build-config" }
 [dev-dependencies]
 codspeed-criterion-compat = "5.0"
 criterion = "0.8.0"
-num-bigint = "0.4.3"
 rust_decimal = { version = "1.0.0", default-features = false }
-hashbrown = "0.17"
 
 [features]
 abi3 = ["pyo3/abi3"]
+
+[[bin]]
+name = "memory-benchmarks"
+path = "src/bin/memory_benchmarks.rs"
 
 [[bench]]
 name = "bench_any"
