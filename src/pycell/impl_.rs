@@ -4,7 +4,11 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::{offset_of, ManuallyDrop, MaybeUninit};
-use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_has_atomic = "32")]
+use core::sync::atomic::AtomicU32;
+#[cfg(not(target_has_atomic = "32"))]
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 
 use crate::impl_::pyclass::{
     PyClassBaseType, PyClassDict, PyClassImpl, PyClassThreadChecker, PyClassWeakRef, PyObjectOffset,
@@ -57,17 +61,28 @@ impl<M: PyClassMutability> PyClassMutability for ExtendsMutableAncestor<M> {
     type MutableChild = ExtendsMutableAncestor<MutableClass>;
 }
 
+#[cfg(target_has_atomic = "32")]
+type AtomicBorrowFlag = AtomicU32;
+#[cfg(target_has_atomic = "32")]
+type BorrowFlagValue = u32;
+
+#[cfg(not(target_has_atomic = "32"))]
+type AtomicBorrowFlag = AtomicUsize;
+#[cfg(not(target_has_atomic = "32"))]
+type BorrowFlagValue = usize;
+
 #[derive(Debug)]
-struct BorrowFlag(AtomicUsize);
+struct BorrowFlag(AtomicBorrowFlag);
 
 impl BorrowFlag {
-    pub(crate) const UNUSED: usize = 0;
-    const HAS_MUTABLE_BORROW: usize = usize::MAX;
+    pub(crate) const UNUSED: BorrowFlagValue = 0;
+    const HAS_MUTABLE_BORROW: BorrowFlagValue = BorrowFlagValue::MAX;
+    const MAX_SHARED_BORROWS: BorrowFlagValue = Self::HAS_MUTABLE_BORROW - 1;
     fn increment(&self) -> Result<(), PyBorrowError> {
         // relaxed is OK because we will read the value again in the compare_exchange
         let mut value = self.0.load(Ordering::Relaxed);
         loop {
-            if value == BorrowFlag::HAS_MUTABLE_BORROW {
+            if value >= BorrowFlag::MAX_SHARED_BORROWS {
                 return Err(PyBorrowError { _private: () });
             }
             match self.0.compare_exchange(
@@ -145,7 +160,7 @@ impl PyClassBorrowChecker for EmptySlot {
 impl PyClassBorrowChecker for BorrowChecker {
     #[inline]
     fn new() -> Self {
-        Self(BorrowFlag(AtomicUsize::new(BorrowFlag::UNUSED)))
+        Self(BorrowFlag(AtomicBorrowFlag::new(BorrowFlag::UNUSED)))
     }
 
     fn try_borrow(&self) -> Result<(), PyBorrowError> {
@@ -651,6 +666,33 @@ mod tests {
     #[pyclass(crate = "crate", extends = BaseWithData)]
     struct ChildWithoutData;
 
+    #[pyclass(crate = "crate")]
+    struct SmallPayload(#[allow(unused)] u8);
+
+    #[cfg(target_has_atomic = "32")]
+    #[test]
+    fn test_borrow_checker_uses_compact_storage() {
+        assert_eq!(
+            core::mem::size_of::<BorrowChecker>(),
+            core::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            core::mem::size_of::<PyClassObjectContents<SmallPayload>>(),
+            8
+        );
+    }
+
+    #[test]
+    fn test_shared_borrow_counter_does_not_overflow() {
+        let borrow_flag = BorrowFlag(AtomicBorrowFlag::new(BorrowFlag::MAX_SHARED_BORROWS));
+
+        assert!(borrow_flag.increment().is_err());
+        assert_eq!(
+            borrow_flag.0.load(Ordering::Relaxed),
+            BorrowFlag::MAX_SHARED_BORROWS
+        );
+    }
+
     #[test]
     fn test_inherited_size() {
         #[cfg(all(Py_LIMITED_API, Py_GIL_DISABLED))]
@@ -876,7 +918,7 @@ mod tests {
 
         let data = SyncUnsafeCell(UnsafeCell::new(0));
         let data2 = SyncUnsafeCell(UnsafeCell::new(0));
-        let borrow_checker = BorrowChecker(BorrowFlag(AtomicUsize::new(BorrowFlag::UNUSED)));
+        let borrow_checker = BorrowChecker(BorrowFlag(AtomicBorrowFlag::new(BorrowFlag::UNUSED)));
 
         std::thread::scope(|s| {
             s.spawn(|| {
