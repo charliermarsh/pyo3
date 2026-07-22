@@ -3,6 +3,7 @@ use crate::model::{
     VariableLengthArgument,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use compact_str::CompactString;
 use goblin::elf::section_header::SHN_XINDEX;
 use goblin::elf::Elf;
 use goblin::mach::load_command::CommandVariant;
@@ -80,12 +81,12 @@ fn parse_chunks(chunks: &[Chunk], main_module_name: &str) -> Result<Module> {
 fn convert_module(
     id: &str,
     name: &str,
-    members: &[String],
+    members: &[CompactString],
     mut incomplete: bool,
     docstring: Option<&str>,
     chunks_by_id: &HashMap<&str, &Chunk>,
     chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Result<Module> {
     let mut member_chunks = chunks_by_parent
         .get(&id)
@@ -125,7 +126,7 @@ fn convert_members<'a>(
     chunks: impl IntoIterator<Item = &'a Chunk>,
     chunks_by_id: &HashMap<&str, &Chunk>,
     chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Result<Members> {
     let mut modules = Vec::new();
     let mut classes = Vec::new();
@@ -239,7 +240,7 @@ fn convert_class(
     docstring: Option<&str>,
     chunks_by_id: &HashMap<&str, &Chunk>,
     chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Result<Class> {
     let (nested_modules, nested_classes, methods, attributes) = convert_members(
         chunks_by_parent.get(&id).into_iter().flatten().copied(),
@@ -275,7 +276,7 @@ fn convert_function(
     returns: &Option<ChunkExpr>,
     is_async: bool,
     docstring: Option<&str>,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Function {
     Function {
         name: name.into(),
@@ -318,10 +319,10 @@ fn convert_function(
 
 fn convert_argument(
     arg: &ChunkArgument,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Argument {
     Argument {
-        name: arg.name.clone(),
+        name: arg.name.to_string(),
         default_value: arg
             .default
             .as_ref()
@@ -335,10 +336,10 @@ fn convert_argument(
 
 fn convert_variable_length_argument(
     arg: &ChunkArgument,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> VariableLengthArgument {
     VariableLengthArgument {
-        name: arg.name.clone(),
+        name: arg.name.to_string(),
         annotation: arg
             .annotation
             .as_ref()
@@ -351,7 +352,7 @@ fn convert_attribute(
     value: &Option<ChunkExpr>,
     annotation: &Option<ChunkExpr>,
     docstring: Option<&str>,
-    type_hint_for_annotation_id: &HashMap<String, Expr>,
+    type_hint_for_annotation_id: &HashMap<&str, Expr>,
 ) -> Attribute {
     Attribute {
         name: name.into(),
@@ -365,12 +366,12 @@ fn convert_attribute(
     }
 }
 
-fn convert_expr(expr: &ChunkExpr, type_hint_for_annotation_id: &HashMap<String, Expr>) -> Expr {
+fn convert_expr(expr: &ChunkExpr, type_hint_for_annotation_id: &HashMap<&str, Expr>) -> Expr {
     match expr {
-        ChunkExpr::Name { id } => Expr::Name { id: id.clone() },
+        ChunkExpr::Name { id } => Expr::Name { id: id.to_string() },
         ChunkExpr::Attribute { value, attr } => Expr::Attribute {
             value: Box::new(convert_expr(value, type_hint_for_annotation_id)),
-            attr: attr.clone(),
+            attr: attr.to_string(),
         },
         ChunkExpr::BinOp { left, op, right } => Expr::BinOp {
             left: Box::new(convert_expr(left, type_hint_for_annotation_id)),
@@ -399,14 +400,14 @@ fn convert_expr(expr: &ChunkExpr, type_hint_for_annotation_id: &HashMap<String, 
             value: match value {
                 ChunkConstant::None => Constant::None,
                 ChunkConstant::Bool { value } => Constant::Bool(*value),
-                ChunkConstant::Int { value } => Constant::Int(value.clone()),
-                ChunkConstant::Float { value } => Constant::Float(value.clone()),
+                ChunkConstant::Int { value } => Constant::Int(value.to_string()),
+                ChunkConstant::Float { value } => Constant::Float(value.to_string()),
                 ChunkConstant::Str { value } => Constant::Str(value.clone()),
                 ChunkConstant::Ellipsis => Constant::Ellipsis,
             },
         },
         ChunkExpr::Id { id } => {
-            if let Some(expr) = type_hint_for_annotation_id.get(id) {
+            if let Some(expr) = type_hint_for_annotation_id.get(id.as_str()) {
                 expr.clone()
             } else {
                 // This is a pyclass not exposed, we fallback to Any
@@ -422,18 +423,18 @@ fn convert_expr(expr: &ChunkExpr, type_hint_for_annotation_id: &HashMap<String, 
 }
 
 /// Returns the type hint for each class introspection id defined in the module and its submodule
-fn introspection_id_to_type_hint_for_root_module(
-    module_chunk: &Chunk,
-    chunks_by_id: &HashMap<&str, &Chunk>,
-    chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-) -> HashMap<String, Expr> {
-    fn add_introspection_id_to_type_hint_for_module_members(
+fn introspection_id_to_type_hint_for_root_module<'a>(
+    module_chunk: &'a Chunk,
+    chunks_by_id: &HashMap<&'a str, &'a Chunk>,
+    chunks_by_parent: &HashMap<&'a str, Vec<&'a Chunk>>,
+) -> HashMap<&'a str, Expr> {
+    fn add_introspection_id_to_type_hint_for_module_members<'a>(
         module_id: &str,
         module_full_name: &str,
-        module_members: &[String],
-        chunks_by_id: &HashMap<&str, &Chunk>,
-        chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-        output: &mut HashMap<String, Expr>,
+        module_members: &[CompactString],
+        chunks_by_id: &HashMap<&'a str, &'a Chunk>,
+        chunks_by_parent: &HashMap<&'a str, Vec<&'a Chunk>>,
+        output: &mut HashMap<&'a str, Expr>,
     ) {
         for member in chunks_by_parent
             .get(&module_id)
@@ -461,12 +462,12 @@ fn introspection_id_to_type_hint_for_root_module(
                 }
                 Chunk::Class { id, name, .. } => {
                     output.insert(
-                        id.clone(),
+                        id.as_str(),
                         Expr::Attribute {
                             value: Box::new(Expr::Name {
                                 id: module_full_name.into(),
                             }),
-                            attr: name.clone(),
+                            attr: name.to_string(),
                         },
                     );
                     add_introspection_id_to_type_hint_for_class_subclasses(
@@ -482,12 +483,12 @@ fn introspection_id_to_type_hint_for_root_module(
         }
     }
 
-    fn add_introspection_id_to_type_hint_for_class_subclasses(
+    fn add_introspection_id_to_type_hint_for_class_subclasses<'a>(
         class_id: &str,
         class_name: &str,
         class_module: &str,
-        chunks_by_parent: &HashMap<&str, Vec<&Chunk>>,
-        output: &mut HashMap<String, Expr>,
+        chunks_by_parent: &HashMap<&'a str, Vec<&'a Chunk>>,
+        output: &mut HashMap<&'a str, Expr>,
     ) {
         for member in chunks_by_parent.get(&class_id).into_iter().flatten() {
             if let Chunk::Class { id, name, .. } = member {
@@ -500,7 +501,7 @@ fn introspection_id_to_type_hint_for_root_module(
                     output,
                 );
                 output.insert(
-                    id.clone(),
+                    id.as_str(),
                     Expr::Attribute {
                         value: Box::new(Expr::Name {
                             id: class_module.into(),
@@ -680,32 +681,32 @@ fn introspection_symbol_version(name: &str) -> Option<&str> {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Chunk {
     Module {
-        id: String,
-        name: String,
-        members: Vec<String>,
+        id: CompactString,
+        name: CompactString,
+        members: Vec<CompactString>,
         #[serde(default)]
         doc: Option<String>,
         incomplete: bool,
     },
     Class {
-        id: String,
-        name: String,
+        id: CompactString,
+        name: CompactString,
         #[serde(default)]
         bases: Vec<ChunkExpr>,
         #[serde(default)]
         decorators: Vec<ChunkExpr>,
         #[serde(default)]
-        parent: Option<String>,
+        parent: Option<CompactString>,
         #[serde(default)]
         doc: Option<String>,
     },
     Function {
         #[serde(default)]
-        id: Option<String>,
-        name: String,
+        id: Option<CompactString>,
+        name: CompactString,
         arguments: Box<ChunkArguments>,
         #[serde(default)]
-        parent: Option<String>,
+        parent: Option<CompactString>,
         #[serde(default)]
         decorators: Vec<ChunkExpr>,
         #[serde(default)]
@@ -717,10 +718,10 @@ enum Chunk {
     },
     Attribute {
         #[serde(default)]
-        id: Option<String>,
+        id: Option<CompactString>,
         #[serde(default)]
-        parent: Option<String>,
-        name: String,
+        parent: Option<CompactString>,
+        name: CompactString,
         #[serde(default)]
         value: Option<ChunkExpr>,
         #[serde(default)]
@@ -746,7 +747,7 @@ struct ChunkArguments {
 
 #[derive(Deserialize)]
 struct ChunkArgument {
-    name: String,
+    name: CompactString,
     #[serde(default)]
     default: Option<ChunkExpr>,
     #[serde(default)]
@@ -762,9 +763,12 @@ enum ChunkExpr {
         value: ChunkConstant,
     },
     /// A name
-    Name { id: String },
+    Name { id: CompactString },
     /// An attribute `value.attr`
-    Attribute { value: Box<Self>, attr: String },
+    Attribute {
+        value: Box<Self>,
+        attr: CompactString,
+    },
     /// A binary operator
     BinOp {
         left: Box<Self>,
@@ -778,7 +782,7 @@ enum ChunkExpr {
     /// A subscript `value[slice]`
     Subscript { value: Box<Self>, slice: Box<Self> },
     /// An introspection id
-    Id { id: String },
+    Id { id: CompactString },
 }
 
 #[derive(Deserialize)]
@@ -786,8 +790,8 @@ enum ChunkExpr {
 pub enum ChunkConstant {
     None,
     Bool { value: bool },
-    Int { value: String },
-    Float { value: String },
+    Int { value: CompactString },
+    Float { value: CompactString },
     Str { value: String },
     Ellipsis,
 }
@@ -796,4 +800,143 @@ pub enum ChunkConstant {
 #[serde(rename_all = "lowercase")]
 pub enum ChunkOperator {
     BitOr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_chunks, Chunk};
+    use crate::model::{Constant, Expr};
+    use serde_json::json;
+
+    #[test]
+    fn compact_identifiers_and_names_deserialize_inline() {
+        let module: Chunk = serde_json::from_value(json!({
+            "type": "module", "id": "18446744073709551615", "name": "sample",
+            "members": ["12345678901234567890"], "incomplete": false
+        }))
+        .unwrap();
+
+        let Chunk::Module {
+            id, name, members, ..
+        } = module
+        else {
+            panic!("expected a module chunk");
+        };
+
+        assert_eq!(id.as_str(), "18446744073709551615");
+        assert_eq!(name.as_str(), "sample");
+        assert_eq!(members[0].as_str(), "12345678901234567890");
+        assert!(!name.is_heap_allocated());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(!id.is_heap_allocated());
+            assert!(!members[0].is_heap_allocated());
+        }
+
+        let class: Chunk = serde_json::from_value(json!({
+            "type": "class", "id": "12345678901234567890", "name": "Widget",
+            "parent": "18446744073709551615"
+        }))
+        .unwrap();
+
+        let Chunk::Class {
+            id, name, parent, ..
+        } = class
+        else {
+            panic!("expected a class chunk");
+        };
+
+        assert_eq!(id.as_str(), "12345678901234567890");
+        assert_eq!(parent.as_deref(), Some("18446744073709551615"));
+        assert!(!name.is_heap_allocated());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(!id.is_heap_allocated());
+            assert!(!parent.unwrap().is_heap_allocated());
+        }
+    }
+
+    #[test]
+    fn long_identifiers_fall_back_to_heap_storage() {
+        let chunk: Chunk = serde_json::from_value(json!({
+            "type": "class",
+            "id": "introspection_identifier_longer_than_twenty_four_bytes",
+            "name": "a_class_name_longer_than_twenty_four_bytes"
+        }))
+        .unwrap();
+
+        let Chunk::Class { id, name, .. } = chunk else {
+            panic!("expected a class chunk");
+        };
+
+        assert_eq!(
+            id.as_str(),
+            "introspection_identifier_longer_than_twenty_four_bytes"
+        );
+        assert_eq!(name.as_str(), "a_class_name_longer_than_twenty_four_bytes");
+        assert!(id.is_heap_allocated());
+        assert!(name.is_heap_allocated());
+    }
+
+    #[test]
+    fn compact_chunks_preserve_public_model_and_resolve_annotation_ids() {
+        let chunks = [
+            json!({
+                "type": "module", "id": "18446744073709551615", "name": "sample",
+                "members": ["12345678901234567890"], "incomplete": false
+            }),
+            json!({
+                "type": "class", "id": "12345678901234567890", "name": "Widget"
+            }),
+            json!({
+                "type": "function", "id": "12345678901234567891",
+                "parent": "12345678901234567890", "name": "describe",
+                "arguments": {"args": [{
+                    "name": "value", "annotation": {
+                        "type": "id", "id": "12345678901234567890"
+                    }
+                }]},
+                "returns": {"type": "id", "id": "12345678901234567890"}
+            }),
+            json!({
+                "type": "attribute", "parent": "12345678901234567890",
+                "name": "label", "value": {
+                    "type": "constant", "kind": "int", "value": "123"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(serde_json::from_value::<Chunk>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+        let module = parse_chunks(&chunks, "sample").unwrap();
+        let class = &module.classes[0];
+        let method = &class.methods[0];
+        let argument = &method.arguments.arguments[0];
+
+        let _: &String = &module.name;
+        let _: &String = &class.name;
+        let _: &String = &method.name;
+        let _: &String = &argument.name;
+        assert_eq!(module.name, "sample");
+        assert_eq!(class.name, "Widget");
+        assert_eq!(method.name, "describe");
+        assert_eq!(argument.name, "value");
+
+        let expected_annotation = Expr::Attribute {
+            value: Box::new(Expr::Name {
+                id: "sample".into(),
+            }),
+            attr: "Widget".into(),
+        };
+        assert_eq!(argument.annotation.as_ref(), Some(&expected_annotation));
+        assert_eq!(method.returns.as_ref(), Some(&expected_annotation));
+        assert_eq!(
+            class.attributes[0].value,
+            Some(Expr::Constant {
+                value: Constant::Int("123".into()),
+            })
+        );
+    }
 }
