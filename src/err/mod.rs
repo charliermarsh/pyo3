@@ -128,12 +128,10 @@ impl PyErr {
         T: PyTypeInfo,
         A: PyErrArguments + Send + Sync + 'static,
     {
-        PyErr::from_state(PyErrState::lazy(Box::new(move |py| {
-            PyErrStateLazyFnOutput {
-                ptype: T::type_object(py).into(),
-                pvalue: args.arguments(py),
-            }
-        })))
+        PyErr::from_state(PyErrState::lazy(move |py| PyErrStateLazyFnOutput {
+            ptype: T::type_object(py).into(),
+            pvalue: args.arguments(py),
+        }))
     }
 
     /// Constructs a new PyErr from the given Python type and arguments.
@@ -931,6 +929,19 @@ mod tests {
 
         assert!(value_of!(IsSend, PyErrState));
         assert!(value_of!(IsSync, PyErrState));
+    }
+
+    #[test]
+    #[cfg(all(Py_3_12, target_pointer_width = "64"))]
+    fn pyerr_keeps_normalized_exceptions_inline() {
+        assert_eq!(
+            core::mem::size_of::<PyErr>(),
+            2 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::size_of::<crate::PyResult<()>>(),
+            3 * core::mem::size_of::<usize>()
+        );
     }
 
     #[test]
