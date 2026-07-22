@@ -67,9 +67,73 @@ use crate::PyTypeInfo;
 #[cfg(not(Py_LIMITED_API))]
 use num_bigint::Sign;
 
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+struct PyLongDigits<'a> {
+    digits: num_bigint::U32Digits<'a>,
+    buffered: u64,
+    buffered_bits: u32,
+    remaining: usize,
+}
+
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+impl<'a> PyLongDigits<'a> {
+    fn new(digits: num_bigint::U32Digits<'a>, bits: u64) -> Self {
+        let remaining = usize::try_from(bits.div_ceil(30).max(1))
+            .expect("integer has more digits than can fit into memory");
+        Self {
+            digits,
+            buffered: 0,
+            buffered_bits: 0,
+            remaining,
+        }
+    }
+}
+
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+impl Iterator for PyLongDigits<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        while self.buffered_bits < 30 {
+            let Some(digit) = self.digits.next() else {
+                break;
+            };
+            self.buffered |= u64::from(digit) << self.buffered_bits;
+            self.buffered_bits += u32::BITS;
+        }
+
+        let digit = self.buffered as u32 & ((1 << 30) - 1);
+        self.buffered >>= 30;
+        self.buffered_bits = self.buffered_bits.saturating_sub(30);
+        self.remaining -= 1;
+        Some(digit)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+impl ExactSizeIterator for PyLongDigits<'_> {}
+
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+fn bigint_is_negative(value: &BigInt) -> bool {
+    value.sign() == num_bigint::Sign::Minus
+}
+
+#[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+fn biguint_is_negative(_: &BigUint) -> bool {
+    false
+}
+
 // for identical functionality between BigInt and BigUint
 macro_rules! bigint_conversion {
-    ($rust_ty: ty, $is_signed: literal) => {
+    ($rust_ty: ty, $is_signed: literal, $is_negative: ident) => {
         #[cfg_attr(docsrs, doc(cfg(feature = "num-bigint")))]
         impl<'py> IntoPyObject<'py> for $rust_ty {
             type Target = PyInt;
@@ -96,6 +160,16 @@ macro_rules! bigint_conversion {
 
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
                 use num_traits::ToBytes;
+
+                #[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
+                if crate::conversions::std::num::is_30bit_layout() {
+                    let digits = PyLongDigits::new(self.iter_u32_digits(), self.bits());
+                    return Ok(crate::conversions::std::num::pylong_from_digits(
+                        py,
+                        $is_negative(self),
+                        digits,
+                    ));
+                }
 
                 #[cfg(all(not(Py_LIMITED_API), Py_3_13))]
                 {
@@ -135,8 +209,8 @@ macro_rules! bigint_conversion {
     };
 }
 
-bigint_conversion!(BigUint, false);
-bigint_conversion!(BigInt, true);
+bigint_conversion!(BigUint, false, biguint_is_negative);
+bigint_conversion!(BigInt, true, bigint_is_negative);
 
 #[cfg_attr(docsrs, doc(cfg(feature = "num-bigint")))]
 impl<'py> FromPyObject<'_, 'py> for BigInt {
@@ -430,6 +504,27 @@ class C:
             let zero: BigInt = 0i32.into_pyobject(py).unwrap().extract().unwrap();
             assert_eq!(zero, BigInt::from(0));
         })
+    }
+
+    #[test]
+    fn convert_big_integer_digit_boundaries() {
+        Python::attach(|py| {
+            for bits in [
+                0usize, 1, 29, 30, 31, 32, 59, 60, 61, 63, 64, 127, 1024, 4096,
+            ] {
+                let magnitude = BigUint::from(1u32) << bits;
+                for value in [magnitude.clone(), &magnitude - 1u32, &magnitude + 1u32] {
+                    let python_value = (&value).into_pyobject(py).unwrap();
+                    assert_eq!(python_value.extract::<BigUint>().unwrap(), value);
+
+                    let signed = BigInt::from(value);
+                    for signed_value in [signed.clone(), -signed] {
+                        let python_value = (&signed_value).into_pyobject(py).unwrap();
+                        assert_eq!(python_value.extract::<BigInt>().unwrap(), signed_value);
+                    }
+                }
+            }
+        });
     }
 
     /// `OverflowError` on converting Python int to BigInt, see issue #629
