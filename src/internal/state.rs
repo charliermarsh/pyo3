@@ -188,6 +188,9 @@ impl Drop for AttachGuard {
 type PyObjVec = Vec<NonNull<ffi::PyObject>>;
 
 #[cfg(not(pyo3_disable_reference_pool))]
+const MAX_RETAINED_DECREF_CAPACITY: usize = 1024;
+
+#[cfg(not(pyo3_disable_reference_pool))]
 /// Thread-safe storage for objects which were dec_ref while not attached.
 struct ReferencePool {
     pending_decrefs: Mutex<PyObjVec>,
@@ -211,11 +214,18 @@ impl ReferencePool {
             return;
         }
 
-        let decrefs = mem::take(&mut *pending_decrefs);
+        let mut decrefs = mem::take(&mut *pending_decrefs);
         drop(pending_decrefs);
 
-        for ptr in decrefs {
+        for ptr in decrefs.drain(..) {
             unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+        }
+
+        if decrefs.capacity() <= MAX_RETAINED_DECREF_CAPACITY {
+            let mut pending_decrefs = self.pending_decrefs.lock().unwrap();
+            if pending_decrefs.is_empty() && pending_decrefs.capacity() < decrefs.capacity() {
+                *pending_decrefs = decrefs;
+            }
         }
     }
 }
@@ -320,6 +330,20 @@ impl Drop for ForbidAttaching {
 pub unsafe fn register_decref(obj: NonNull<ffi::PyObject>) {
     #[cfg(not(pyo3_disable_reference_pool))]
     {
+        #[cfg(all(Py_3_12, not(any(Py_LIMITED_API, PyPy, GraalPy, RustPython))))]
+        {
+            let ptr = obj.as_ptr();
+
+            // On these CPython builds, the singleton helpers only return the addresses of
+            // immortal static objects; they do not call back into the interpreter.
+            if core::ptr::eq(ptr, unsafe { ffi::Py_None() })
+                || core::ptr::eq(ptr, unsafe { ffi::Py_True() })
+                || core::ptr::eq(ptr, unsafe { ffi::Py_False() })
+            {
+                return;
+            }
+        }
+
         get_pool().register_decref(obj);
     }
     #[cfg(all(
@@ -449,6 +473,82 @@ mod tests {
             #[cfg(not(Py_GIL_DISABLED))]
             assert_eq!(obj._get_refcnt(py), 1);
             assert!(pool_dec_refs_does_not_contain(&obj));
+        });
+    }
+
+    #[test]
+    #[cfg(not(pyo3_disable_reference_pool))]
+    fn test_reference_pool_reuses_bounded_storage() {
+        Python::attach(|py| {
+            let pool = ReferencePool::new();
+            let object = get_object(py);
+            pool.register_decref(NonNull::new(object.clone_ref(py).into_ptr()).unwrap());
+
+            let (buffer, capacity) = {
+                let pending = pool.pending_decrefs.lock().unwrap();
+                (pending.as_ptr(), pending.capacity())
+            };
+
+            pool.drop_deferred_references(py);
+
+            let pending = pool.pending_decrefs.lock().unwrap();
+            assert!(pending.is_empty());
+            assert_eq!(pending.as_ptr(), buffer);
+            assert_eq!(pending.capacity(), capacity);
+        });
+    }
+
+    #[test]
+    #[cfg(not(pyo3_disable_reference_pool))]
+    fn test_reference_pool_does_not_retain_large_storage() {
+        Python::attach(|py| {
+            let pool = ReferencePool::new();
+            let object = get_object(py);
+
+            {
+                let mut pending = pool.pending_decrefs.lock().unwrap();
+                pending.reserve(MAX_RETAINED_DECREF_CAPACITY + 1);
+                pending.push(NonNull::new(object.clone_ref(py).into_ptr()).unwrap());
+                assert!(pending.capacity() > MAX_RETAINED_DECREF_CAPACITY);
+            }
+
+            pool.drop_deferred_references(py);
+
+            let pending = pool.pending_decrefs.lock().unwrap();
+            assert!(pending.is_empty());
+            assert_eq!(pending.capacity(), 0);
+        });
+    }
+
+    #[test]
+    #[cfg(all(
+        not(pyo3_disable_reference_pool),
+        Py_3_12,
+        not(any(Py_LIMITED_API, PyPy, GraalPy, RustPython))
+    ))]
+    fn test_detached_immortal_singletons_are_not_queued() {
+        Python::attach(|py| {
+            let objects = [
+                py.None(),
+                crate::types::PyBool::new(py, true)
+                    .to_owned()
+                    .into_any()
+                    .unbind(),
+                crate::types::PyBool::new(py, false)
+                    .to_owned()
+                    .into_any()
+                    .unbind(),
+            ];
+            let pointers = objects.each_ref().map(|object| object.as_ptr() as usize);
+
+            py.detach(move || {
+                drop(objects);
+
+                let pending = get_pool().pending_decrefs.lock().unwrap();
+                assert!(pending
+                    .iter()
+                    .all(|object| !pointers.contains(&(object.as_ptr() as usize))));
+            });
         });
     }
 
