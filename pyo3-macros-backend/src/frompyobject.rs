@@ -66,14 +66,19 @@ impl<'a> Enum<'a> {
         let mut error_names = Vec::new();
 
         for var in &self.variants {
-            let struct_derive = var.build(ctx);
+            let struct_derive = var.build(ctx, true);
             let ext = quote!({
-                let maybe_ret = || -> #pyo3_path::PyResult<Self> {
+                let maybe_ret = || -> ::std::result::Result<
+                    Self,
+                    #pyo3_path::impl_::frompyobject::DeferredFromPyObjectError,
+                > {
                     #struct_derive
                 }();
 
                 match maybe_ret {
-                    ok @ ::std::result::Result::Ok(_) => return ok,
+                    ::std::result::Result::Ok(value) => {
+                        return ::std::result::Result::Ok(value)
+                    }
                     ::std::result::Result::Err(err) => err
                 }
             });
@@ -289,16 +294,16 @@ impl<'a> Container<'a> {
     }
 
     /// Build derivation body for a struct.
-    fn build(&self, ctx: &Ctx) -> TokenStream {
+    fn build(&self, ctx: &Ctx, defer_errors: bool) -> TokenStream {
         match &self.ty {
             ContainerType::StructNewtype(ident, from_py_with, _) => {
-                self.build_newtype_struct(Some(ident), from_py_with, ctx)
+                self.build_newtype_struct(Some(ident), from_py_with, ctx, defer_errors)
             }
             ContainerType::TupleNewtype(from_py_with, _) => {
-                self.build_newtype_struct(None, from_py_with, ctx)
+                self.build_newtype_struct(None, from_py_with, ctx, defer_errors)
             }
-            ContainerType::Tuple(tups) => self.build_tuple_struct(tups, ctx),
-            ContainerType::Struct(tups) => self.build_struct(tups, ctx),
+            ContainerType::Tuple(tups) => self.build_tuple_struct(tups, ctx, defer_errors),
+            ContainerType::Struct(tups) => self.build_struct(tups, ctx, defer_errors),
         }
     }
 
@@ -307,12 +312,23 @@ impl<'a> Container<'a> {
         field_ident: Option<&Ident>,
         from_py_with: &Option<FromPyWithAttribute>,
         ctx: &Ctx,
+        defer_errors: bool,
     ) -> TokenStream {
         let Ctx { pyo3_path, .. } = ctx;
         let self_ty = &self.path;
         let struct_name = self.name();
         if let Some(ident) = field_ident {
             let field_name = ident.to_string();
+            let extract_struct_field = if defer_errors {
+                quote!(extract_struct_field_deferred)
+            } else {
+                quote!(extract_struct_field)
+            };
+            let extract_struct_field_with = if defer_errors {
+                quote!(extract_struct_field_with_deferred)
+            } else {
+                quote!(extract_struct_field_with)
+            };
             if let Some(FromPyWithAttribute {
                 kw,
                 value: expr_path,
@@ -323,13 +339,13 @@ impl<'a> Container<'a> {
                 };
                 quote! {
                     Ok(#self_ty {
-                        #ident: #pyo3_path::impl_::frompyobject::extract_struct_field_with(#extractor, obj, #struct_name, #field_name)?
+                        #ident: #pyo3_path::impl_::frompyobject::#extract_struct_field_with(#extractor, obj, #struct_name, #field_name)?
                     })
                 }
             } else {
                 quote! {
                     Ok(#self_ty {
-                        #ident: #pyo3_path::impl_::frompyobject::extract_struct_field(obj, #struct_name, #field_name)?
+                        #ident: #pyo3_path::impl_::frompyobject::#extract_struct_field(obj, #struct_name, #field_name)?
                     })
                 }
             }
@@ -338,26 +354,51 @@ impl<'a> Container<'a> {
             value: expr_path,
         }) = from_py_with
         {
+            let extract_tuple_struct_field_with = if defer_errors {
+                quote!(extract_tuple_struct_field_with_deferred)
+            } else {
+                quote!(extract_tuple_struct_field_with)
+            };
             let extractor = quote_spanned! { kw.span =>
                 { let from_py_with: fn(_) -> _ = #expr_path; from_py_with }
             };
             quote! {
-                #pyo3_path::impl_::frompyobject::extract_tuple_struct_field_with(#extractor, obj, #struct_name, 0).map(#self_ty)
+                #pyo3_path::impl_::frompyobject::#extract_tuple_struct_field_with(#extractor, obj, #struct_name, 0).map(#self_ty)
             }
         } else {
+            let extract_tuple_struct_field = if defer_errors {
+                quote!(extract_tuple_struct_field_deferred)
+            } else {
+                quote!(extract_tuple_struct_field)
+            };
             quote! {
-                #pyo3_path::impl_::frompyobject::extract_tuple_struct_field(obj, #struct_name, 0).map(#self_ty)
+                #pyo3_path::impl_::frompyobject::#extract_tuple_struct_field(obj, #struct_name, 0).map(#self_ty)
             }
         }
     }
 
-    fn build_tuple_struct(&self, struct_fields: &[TupleStructField], ctx: &Ctx) -> TokenStream {
+    fn build_tuple_struct(
+        &self,
+        struct_fields: &[TupleStructField],
+        ctx: &Ctx,
+        defer_errors: bool,
+    ) -> TokenStream {
         let Ctx { pyo3_path, .. } = ctx;
         let self_ty = &self.path;
         let struct_name = &self.name();
         let field_idents: Vec<_> = (0..struct_fields.len())
             .map(|i| format_ident!("arg{}", i))
             .collect();
+        let extract_tuple_struct_field = if defer_errors {
+            quote!(extract_tuple_struct_field_deferred)
+        } else {
+            quote!(extract_tuple_struct_field)
+        };
+        let extract_tuple_struct_field_with = if defer_errors {
+            quote!(extract_tuple_struct_field_with_deferred)
+        } else {
+            quote!(extract_tuple_struct_field_with)
+        };
         let fields = struct_fields.iter().zip(&field_idents).enumerate().map(|(index, (field, ident))| {
             if let Some(FromPyWithAttribute {
                 kw,
@@ -367,27 +408,44 @@ impl<'a> Container<'a> {
                     { let from_py_with: fn(_) -> _ = #expr_path; from_py_with }
                 };
                quote! {
-                    #pyo3_path::impl_::frompyobject::extract_tuple_struct_field_with(#extractor, &#ident, #struct_name, #index)?
+                    #pyo3_path::impl_::frompyobject::#extract_tuple_struct_field_with(#extractor, &#ident, #struct_name, #index)?
                }
             } else {
                 quote!{
-                    #pyo3_path::impl_::frompyobject::extract_tuple_struct_field(&#ident, #struct_name, #index)?
+                    #pyo3_path::impl_::frompyobject::#extract_tuple_struct_field(&#ident, #struct_name, #index)?
             }}
         });
 
         quote!(
             match #pyo3_path::types::PyAnyMethods::extract(obj) {
                 ::std::result::Result::Ok((#(#field_idents),*)) => ::std::result::Result::Ok(#self_ty(#(#fields),*)),
-                ::std::result::Result::Err(err) => ::std::result::Result::Err(err),
+                ::std::result::Result::Err(err) => {
+                    ::std::result::Result::Err(::std::convert::Into::into(err))
+                }
             }
         )
     }
 
-    fn build_struct(&self, struct_fields: &[NamedStructField<'_>], ctx: &Ctx) -> TokenStream {
+    fn build_struct(
+        &self,
+        struct_fields: &[NamedStructField<'_>],
+        ctx: &Ctx,
+        defer_errors: bool,
+    ) -> TokenStream {
         let Ctx { pyo3_path, .. } = ctx;
         let self_ty = &self.path;
         let struct_name = self.name();
         let mut fields: Punctuated<TokenStream, Token![,]> = Punctuated::new();
+        let extract_struct_field = if defer_errors {
+            quote!(extract_struct_field_deferred)
+        } else {
+            quote!(extract_struct_field)
+        };
+        let extract_struct_field_with = if defer_errors {
+            quote!(extract_struct_field_with_deferred)
+        } else {
+            quote!(extract_struct_field_with)
+        };
         for field in struct_fields {
             let ident = field.ident;
             let field_name = ident.unraw().to_string();
@@ -428,9 +486,9 @@ impl<'a> Container<'a> {
                 let extractor = quote_spanned! { kw.span =>
                     { let from_py_with: fn(_) -> _ = #expr_path; from_py_with }
                 };
-                quote! (#pyo3_path::impl_::frompyobject::extract_struct_field_with(#extractor, &#getter?, #struct_name, #field_name)?)
+                quote! (#pyo3_path::impl_::frompyobject::#extract_struct_field_with(#extractor, &#getter?, #struct_name, #field_name)?)
             } else {
-                quote!(#pyo3_path::impl_::frompyobject::extract_struct_field(&value, #struct_name, #field_name)?)
+                quote!(#pyo3_path::impl_::frompyobject::#extract_struct_field(&value, #struct_name, #field_name)?)
             };
             let extracted = if let Some(default) = &field.default {
                 let default_expr = if let Some(default_expr) = &default.value {
@@ -545,7 +603,7 @@ pub fn build_derive_from_pyobject(tokens: &DeriveInput) -> Result<TokenStream> {
             }
             let ident = &tokens.ident;
             let st = Container::new(&st.fields, parse_quote!(#ident), options.clone())?;
-            st.build(ctx)
+            st.build(ctx, false)
         }
         syn::Data::Union(_) => bail_spanned!(
             tokens.span() => "#[derive(FromPyObject)] is not supported for unions"

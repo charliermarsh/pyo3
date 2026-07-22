@@ -592,6 +592,36 @@ fn test_enum_catch_all() {
     });
 }
 
+#[test]
+fn test_enum_does_not_repeat_failed_extractors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static EXTRACTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn failed_extractor(_: &Bound<'_, PyAny>) -> PyResult<usize> {
+        EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
+        Err(PyValueError::new_err("speculative extraction failed"))
+    }
+
+    #[derive(Debug, FromPyObject)]
+    enum ExtractOnce<'py> {
+        #[allow(dead_code)]
+        Failed(#[pyo3(from_py_with = failed_extractor)] usize),
+        Succeeded(Bound<'py, PyAny>),
+    }
+
+    Python::attach(|py| {
+        EXTRACTIONS.store(0, Ordering::Relaxed);
+        let value = py.None();
+        let extracted = value.extract::<ExtractOnce<'_>>(py).unwrap();
+        let ExtractOnce::Succeeded(value) = extracted else {
+            panic!("the catch-all enum variant should have succeeded");
+        };
+        assert!(value.is_none());
+        assert_eq!(EXTRACTIONS.load(Ordering::Relaxed), 1);
+    });
+}
+
 #[derive(Debug, FromPyObject)]
 pub enum Bar {
     #[pyo3(annotation = "str")]
